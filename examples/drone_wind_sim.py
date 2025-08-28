@@ -75,7 +75,65 @@ def main() -> None:
     )
     parser.add_argument("--sph-interval", type=int, default=1, help="Emit every k steps (>=1)")
 
+    # Presets (applies after parsing and may override provided defaults)
+    parser.add_argument(
+        "-p",
+        "--preset",
+        choices=[
+            "calm",
+            "breezy",
+            "storm",
+            "drizzle-sph",
+            "downpour-sph",
+        ],
+        help="Convenience presets for typical conditions",
+    )
+
     args = parser.parse_args()
+
+    # Apply presets by updating parsed args as baseline (flags still can override by re-running)
+    if args.preset:
+        presets = {
+            # Light mode presets
+            "calm": {
+                "mode": "light",
+                "wind": (0.5, 0.0, 0.0),
+                "rain_down": 0.2,
+                "drag": 0.05,
+            },
+            "breezy": {
+                "mode": "light",
+                "wind": (2.0, 0.3, 0.0),
+                "rain_down": 0.6,
+                "drag": 0.12,
+            },
+            "storm": {
+                "mode": "light",
+                "wind": (8.0, 1.0, 0.0),
+                "rain_down": 2.0,
+                "drag": 0.3,
+            },
+            # SPH mode presets
+            "drizzle-sph": {
+                "mode": "sph",
+                "wind": (1.0, 0.0, 0.0),
+                "sph_size": 0.035,
+                "sph_speed": 3.0,
+                "sph_interval": 4,
+                "sph_pos": (0.0, 0.0, 2.5),
+            },
+            "downpour-sph": {
+                "mode": "sph",
+                "wind": (3.0, 0.5, 0.0),
+                "sph_size": 0.02,
+                "sph_speed": 6.0,
+                "sph_interval": 1,
+                "sph_pos": (0.0, 0.0, 2.5),
+            },
+        }
+        cfg = presets[args.preset]
+        for k, v in cfg.items():
+            setattr(args, k, v)
     # Initialize Genesis; default to CPU backend on Windows
     # Use a simple theme to avoid Unicode box characters on some consoles
     init_kwargs = dict(backend=gs.cpu, theme="dumb")
