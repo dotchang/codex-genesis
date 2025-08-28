@@ -23,3 +23,14 @@ This repository contains small code snippets for the Genesis physics simulator.
   Notes:
   - Windows console may not render Unicode emojis/box characters; the example sets `theme="dumb"` and supports `--quiet` to reduce banners.
   - SPH mode is more physically/visually detailed but heavier than the light mode. Start with defaults before increasing particle rate.
+### Presets
+You can quickly try typical scenarios with `-p/--preset`:
+- `calm` (light): light wind, gentle rain force, mild drag
+- `breezy` (light): medium wind, moderate rain force, moderate drag
+- `storm` (light): strong wind, heavy rain force, stronger drag
+- `drizzle-sph` (sph): sparse particle rain, slower speed, less frequent emission
+- `downpour-sph` (sph): small droplets, fast speed, frequent emission
+
+Examples:
+- `python examples\drone_wind_sim.py --preset calm --steps 300 --quiet`
+- `python examples\drone_wind_sim.py --preset drizzle-sph --steps 300 --quiet`
