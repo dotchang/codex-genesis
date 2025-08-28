@@ -36,6 +36,11 @@ def main() -> None:
 
     # Constant wind force (Newtons), applied at the drone's COM link
     wind_force = torch.tensor([[[2.0, 0.0, 0.0]]], device=gs.device, dtype=gs.tc_float)
+
+    # Lightweight "rain" effect: constant downward force and optional linear drag
+    # Tune these to change rainfall intensity and damping
+    rain_down_force = torch.tensor([[[0.0, 0.0, -0.8]]], device=gs.device, dtype=gs.tc_float)
+    drag_coeff = 0.0  # e.g., set to 0.2 to enable simple velocity-proportional drag
     # Use the base link as application point
     com_link = [drone.base_link_idx]
 
@@ -45,6 +50,19 @@ def main() -> None:
         scene.sim.rigid_solver.apply_links_external_force(
             force=wind_force, links_idx=com_link, ref="link_com", local=False
         )
+
+        # Apply constant downward "rain" force
+        scene.sim.rigid_solver.apply_links_external_force(
+            force=rain_down_force, links_idx=com_link, ref="link_com", local=False
+        )
+
+        # Optional: apply simple linear drag proportional to current velocity
+        if drag_coeff > 0.0:
+            cur_vel = drone.get_vel()  # shape: (B, 3)
+            drag_force = (-drag_coeff * cur_vel).unsqueeze(1).contiguous()  # (B,1,3)
+            scene.sim.rigid_solver.apply_links_external_force(
+                force=drag_force, links_idx=com_link, ref="link_com", local=False
+            )
 
         # Step physics
         scene.step()
