@@ -1,12 +1,21 @@
-"""Drone flight under constant wind using Genesis.
+"""Drone flight under wind and rain using Genesis.
 
 This example uses the upstream Genesis API (Scene + Drone morph) to spawn a
-Crazyflie CF2X quadrotor and apply a constant wind force at each step.
+Crazyflie CF2X quadrotor and simulate environmental effects:
+- Light mode: constant wind + downward rain force (+ optional linear drag)
+- SPH mode: particle-based rain (SPH Liquid + emitter)
+
+Usage examples:
+  python examples/drone_wind_sim.py                         # light mode
+  python examples/drone_wind_sim.py --mode sph              # SPH rain
+  python examples/drone_wind_sim.py --wind 1 0 0 --steps 300
+  python examples/drone_wind_sim.py --drag 0.2 --vis
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 import numpy as np
 import torch
 
@@ -41,10 +50,38 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["light", "sph"], default="light", help="Rain model: light or SPH")
     parser.add_argument("-v", "--vis", action="store_true", help="Show viewer")
+
+    # General runtime controls
+    parser.add_argument("--steps", type=int, default=1000, help="Number of simulation steps")
+    parser.add_argument(
+        "--wind", type=float, nargs=3, metavar=("WX", "WY", "WZ"), default=(2.0, 0.0, 0.0), help="Wind force (N)"
+    )
+    parser.add_argument("--quiet", action="store_true", help="Reduce logging (suppress INFO banners/emojis)")
+
+    # Light rain parameters
+    parser.add_argument("--rain-down", type=float, default=0.8, help="Downward rain force magnitude (N)")
+    parser.add_argument("--drag", type=float, default=0.0, help="Linear drag coefficient (N·s/m), 0 disables")
+
+    # SPH parameters
+    parser.add_argument("--sph-size", type=float, default=0.03, help="Droplet size (m); smaller => more particles")
+    parser.add_argument("--sph-speed", type=float, default=4.0, help="Initial droplet speed (m/s)")
+    parser.add_argument(
+        "--sph-pos",
+        type=float,
+        nargs=3,
+        metavar=("PX", "PY", "PZ"),
+        default=(0.0, 0.0, 2.5),
+        help="Emitter position (m)",
+    )
+    parser.add_argument("--sph-interval", type=int, default=1, help="Emit every k steps (>=1)")
+
     args = parser.parse_args()
     # Initialize Genesis; default to CPU backend on Windows
     # Use a simple theme to avoid Unicode box characters on some consoles
-    gs.init(backend=gs.cpu, theme="dumb")
+    init_kwargs = dict(backend=gs.cpu, theme="dumb")
+    if args.quiet:
+        init_kwargs["logging_level"] = logging.WARNING
+    gs.init(**init_kwargs)
 
     # Create a scene with 10 ms timestep
     scene = gs.Scene(
@@ -65,16 +102,16 @@ def main() -> None:
     scene.build(n_envs=1)
 
     # Constant wind force (Newtons), applied at the drone's COM link
-    wind_force = torch.tensor([[[2.0, 0.0, 0.0]]], device=gs.device, dtype=gs.tc_float)
+    wind_force = torch.tensor([[list(args.wind)]], device=gs.device, dtype=gs.tc_float)
 
     # Lightweight model parameters (unused if mode == 'sph')
-    rain_down_force = torch.tensor([[[0.0, 0.0, -0.8]]], device=gs.device, dtype=gs.tc_float)
-    drag_coeff = 0.0  # set >0 (e.g., 0.2) to enable simple velocity-proportional drag
+    rain_down_force = torch.tensor([[[0.0, 0.0, -abs(args.rain_down)]]], device=gs.device, dtype=gs.tc_float)
+    drag_coeff = float(args.drag)  # set >0 (e.g., 0.2) to enable simple velocity-proportional drag
     # Use the base link as application point
     com_link = [drone.base_link_idx]
 
     # Run the simulation
-    for step in range(1000):
+    for step in range(int(args.steps)):
         # Apply wind force to the COM link
         scene.sim.rigid_solver.apply_links_external_force(
             force=wind_force, links_idx=com_link, ref="link_com", local=False
@@ -94,14 +131,15 @@ def main() -> None:
                     force=drag_force, links_idx=com_link, ref="link_com", local=False
                 )
         else:
-            # Emit SPH rain particles each step (light rate to keep it fast)
-            emitter.emit(
-                droplet_shape=emit_cfg["droplet_shape"],
-                droplet_size=emit_cfg["droplet_size"],
-                pos=emit_cfg["pos"],
-                direction=emit_cfg["direction"],
-                speed=emit_cfg["speed"],
-            )
+            # Emit SPH rain particles every k steps (keep rate modest for performance)
+            if step % max(1, int(args.sph_interval)) == 0:
+                emitter.emit(
+                    droplet_shape=emit_cfg["droplet_shape"],
+                    droplet_size=float(args.sph_size),
+                    pos=tuple(args.sph_pos),
+                    direction=emit_cfg["direction"],
+                    speed=float(args.sph_speed),
+                )
 
         # Step physics
         scene.step()
