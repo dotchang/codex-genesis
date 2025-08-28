@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import numpy as np
 import torch
 
@@ -68,6 +69,10 @@ def main() -> None:
     parser.add_argument(
         "--cam-lookat", type=float, nargs=3, metavar=("X", "Y", "Z"), default=(0.0, 0.0, 0.5), help="Camera lookat"
     )
+    parser.add_argument("--multi-cam", action="store_true", help="Record from two viewpoints (front and top)")
+    parser.add_argument("--snap-dir", type=str, help="Directory to save PNG snapshots (every k steps)")
+    parser.add_argument("--snap-interval", type=int, default=0, help="Save a PNG every k steps (0 disables)")
+    parser.add_argument("--snap-prefix", type=str, default="frame", help="Snapshot filename prefix")
 
     # Light rain parameters
     parser.add_argument("--rain-down", type=float, default=0.8, help="Downward rain force magnitude (N)")
@@ -167,21 +172,38 @@ def main() -> None:
     if args.mode == "sph":
         emitter, emit_cfg = setup_sph_rain(scene)
 
-    # Optional recording camera (must be added BEFORE build)
-    cam = None
-    if args.record:
-        cam = scene.add_camera(
-            res=tuple(map(int, args.res)),
-            pos=tuple(map(float, args.cam_pos)),
-            lookat=tuple(map(float, args.cam_lookat)),
-            fov=40,
-            GUI=False,
+    # Optional offscreen cameras (must be added BEFORE build)
+    cams = []
+    need_camera = bool(args.record) or (args.snap_dir is not None and int(args.snap_interval) > 0)
+    if need_camera:
+        # Primary/front camera from CLI
+        cams.append(
+            scene.add_camera(
+                res=tuple(map(int, args.res)),
+                pos=tuple(map(float, args.cam_pos)),
+                lookat=tuple(map(float, args.cam_lookat)),
+                fov=40,
+                GUI=False,
+            )
         )
+        # Optional top-down camera
+        if args.multi_cam:
+            cams.append(
+                scene.add_camera(
+                    res=tuple(map(int, args.res)),
+                    pos=(0.0, 0.0, 5.0),
+                    lookat=(0.0, 0.0, 0.5),
+                    fov=50,
+                    GUI=False,
+                )
+            )
 
     # Build the scene for a single environment
     scene.build(n_envs=1)
-    if cam is not None:
-        cam.start_recording()
+    # Start recording if requested
+    if args.record and cams:
+        for c in cams:
+            c.start_recording()
 
     # Constant wind force (Newtons), applied at the drone's COM link
     wind_force = torch.tensor([[list(args.wind)]], device=gs.device, dtype=gs.tc_float)
@@ -226,18 +248,30 @@ def main() -> None:
         # Step physics
         scene.step()
 
-        # Capture a frame if recording
-        if cam is not None:
-            cam.render(rgb=True, depth=False, segmentation=False, normal=False)
+        # Capture a frame for recording/snapshots
+        if cams:
+            for idx, c in enumerate(cams):
+                rgb_arr, *_ = c.render(rgb=True, depth=False, segmentation=False, normal=False)
+                # Save snapshots if enabled and interval reached
+                if args.snap_dir and args.snap_interval and (step % int(args.snap_interval) == 0):
+                    out_dir = args.snap_dir
+                    os.makedirs(out_dir, exist_ok=True)
+                    img = rgb_arr if isinstance(rgb_arr, np.ndarray) else rgb_arr.detach().cpu().numpy()
+                    # Convert from (H,W,3) float [0,1] or uint8 as returned by renderer
+                    gs.tools.save_img_arr(img, os.path.join(out_dir, f"{args.snap_prefix}_{idx}_{step:04d}.png"))
 
         # Read and print state
         pos = drone.get_pos()[0].cpu().numpy()
         vel = drone.get_vel()[0].cpu().numpy()
         print(f"{step:04d}: position={pos}, velocity={vel}")
 
-    # Finalize recording
-    if cam is not None:
-        cam.stop_recording(save_to_filename=args.record, fps=int(args.fps))
+    # Finalize recording (write one MP4 per camera)
+    if args.record and cams:
+        base = args.record
+        root, ext = os.path.splitext(base)
+        for idx, c in enumerate(cams):
+            filename = base if len(cams) == 1 else f"{root}_cam{idx}{ext or '.mp4'}"
+            c.stop_recording(save_to_filename=filename, fps=int(args.fps))
 
 
 if __name__ == "__main__":
