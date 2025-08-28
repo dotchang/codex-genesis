@@ -44,3 +44,12 @@ Examples:
   from moviepy import VideoFileClip
   VideoFileClip('out.mp4').write_gif('out.gif', fps=30)
   ```
+
+### Multi-camera & Snapshots
+- Record two viewpoints simultaneously:
+  - `--multi-cam` creates a top view in addition to the front camera.
+  - Example: `python examples\drone_wind_sim.py --preset storm --steps 600 --record out.mp4 --multi-cam --quiet`
+    - Outputs: `out_cam0.mp4` (front), `out_cam1.mp4` (top)
+- Periodic PNG snapshots:
+  - `--snap-dir snaps --snap-interval 10 --snap-prefix storm`
+  - Saves `snaps/storm_<camIdx>_####.png` every 10 steps for each active camera.
