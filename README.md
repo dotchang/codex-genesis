@@ -34,3 +34,13 @@ You can quickly try typical scenarios with `-p/--preset`:
 Examples:
 - `python examples\drone_wind_sim.py --preset calm --steps 300 --quiet`
 - `python examples\drone_wind_sim.py --preset drizzle-sph --steps 300 --quiet`
+
+### Recording (MP4/GIF)
+- Save MP4 while simulating (offscreen camera):
+  - `python examples\drone_wind_sim.py --preset breezy --steps 600 --record out.mp4 --fps 60 --res 640 480 --quiet`
+  - Camera pose options: `--cam-pos X Y Z`, `--cam-lookat X Y Z`
+- Convert MP4 to GIF (Python, moviepy):
+  ```python
+  from moviepy import VideoFileClip
+  VideoFileClip('out.mp4').write_gif('out.gif', fps=30)
+  ```
