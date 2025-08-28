@@ -74,6 +74,16 @@ def main() -> None:
     parser.add_argument("--snap-interval", type=int, default=0, help="Save a PNG every k steps (0 disables)")
     parser.add_argument("--snap-prefix", type=str, default="frame", help="Snapshot filename prefix")
 
+    # Camera following (keep drone centered)
+    parser.add_argument("--follow", action="store_true", help="Move camera to keep the drone centered")
+    parser.add_argument("--follow-smooth", type=float, default=0.9, help="EMA smoothing factor [0..1) for follow")
+    parser.add_argument(
+        "--follow-fixed-z",
+        type=float,
+        default=None,
+        help="Fix camera Z while following (omit to follow in Z as well)",
+    )
+
     # Light rain parameters
     parser.add_argument("--rain-down", type=float, default=0.8, help="Downward rain force magnitude (N)")
     parser.add_argument("--drag", type=float, default=0.0, help="Linear drag coefficient (N·s/m), 0 disables")
@@ -177,26 +187,30 @@ def main() -> None:
     need_camera = bool(args.record) or (args.snap_dir is not None and int(args.snap_interval) > 0)
     if need_camera:
         # Primary/front camera from CLI
-        cams.append(
-            scene.add_camera(
-                res=tuple(map(int, args.res)),
-                pos=tuple(map(float, args.cam_pos)),
-                lookat=tuple(map(float, args.cam_lookat)),
-                fov=40,
-                GUI=False,
-            )
+        cam_main = scene.add_camera(
+            res=tuple(map(int, args.res)),
+            pos=tuple(map(float, args.cam_pos)),
+            lookat=tuple(map(float, args.cam_lookat)),
+            fov=40,
+            GUI=False,
         )
+        cams.append(cam_main)
         # Optional top-down camera
         if args.multi_cam:
-            cams.append(
-                scene.add_camera(
-                    res=tuple(map(int, args.res)),
-                    pos=(0.0, 0.0, 5.0),
-                    lookat=(0.0, 0.0, 0.5),
-                    fov=50,
-                    GUI=False,
-                )
+            cam_top = scene.add_camera(
+                res=tuple(map(int, args.res)),
+                pos=(0.0, 0.0, 5.0),
+                lookat=(0.0, 0.0, 0.5),
+                fov=50,
+                GUI=False,
             )
+            cams.append(cam_top)
+
+    # If following is requested, set cameras to follow the drone entity (before build)
+    if args.follow and (need_camera):
+        fixed_axis = (None, None, args.follow_fixed_z) if args.follow_fixed_z is not None else (None, None, None)
+        for c in cams:
+            c.follow_entity(drone, fixed_axis=fixed_axis, smoothing=float(args.follow_smooth), fix_orientation=False)
 
     # Build the scene for a single environment
     scene.build(n_envs=1)
