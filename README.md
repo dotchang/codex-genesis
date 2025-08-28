@@ -53,3 +53,15 @@ Examples:
 - Periodic PNG snapshots:
   - `--snap-dir snaps --snap-interval 10 --snap-prefix storm`
   - Saves `snaps/storm_<camIdx>_####.png` every 10 steps for each active camera.
+
+### PLATEAU City Loader
+- Load glTF/GLB/OBJ/PLY tiles from a directory and place them in a Genesis scene.
+- Auto-centers geometry with a sampled scan so models appear near the origin.
+- Supports MP4 recording and periodic PNG snapshots.
+
+Usage:
+- `python examples\plateau_city_loader.py --data-dir C:\data\PLATEAU\tiles --max-files 200 --vis --quiet`
+- Disable centering: `--center none`
+- Manual offset: `--offset 1000 2000 0`
+- Record: `--record city.mp4 --fps 60 --res 1280 720`
+- Snapshots: `--snap-dir snaps --snap-interval 20`
