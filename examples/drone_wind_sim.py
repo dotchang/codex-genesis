@@ -58,6 +58,17 @@ def main() -> None:
     )
     parser.add_argument("--quiet", action="store_true", help="Reduce logging (suppress INFO banners/emojis)")
 
+    # Recording controls (offscreen camera)
+    parser.add_argument("--record", type=str, help="Save an MP4 video to this path (e.g., out.mp4)")
+    parser.add_argument("--fps", type=int, default=60, help="Recording FPS (when --record is set)")
+    parser.add_argument("--res", type=int, nargs=2, metavar=("W", "H"), default=(640, 480), help="Camera resolution")
+    parser.add_argument(
+        "--cam-pos", type=float, nargs=3, metavar=("X", "Y", "Z"), default=(3.5, 0.0, 2.5), help="Camera position"
+    )
+    parser.add_argument(
+        "--cam-lookat", type=float, nargs=3, metavar=("X", "Y", "Z"), default=(0.0, 0.0, 0.5), help="Camera lookat"
+    )
+
     # Light rain parameters
     parser.add_argument("--rain-down", type=float, default=0.8, help="Downward rain force magnitude (N)")
     parser.add_argument("--drag", type=float, default=0.0, help="Linear drag coefficient (N·s/m), 0 disables")
@@ -156,8 +167,21 @@ def main() -> None:
     if args.mode == "sph":
         emitter, emit_cfg = setup_sph_rain(scene)
 
+    # Optional recording camera (must be added BEFORE build)
+    cam = None
+    if args.record:
+        cam = scene.add_camera(
+            res=tuple(map(int, args.res)),
+            pos=tuple(map(float, args.cam_pos)),
+            lookat=tuple(map(float, args.cam_lookat)),
+            fov=40,
+            GUI=False,
+        )
+
     # Build the scene for a single environment
     scene.build(n_envs=1)
+    if cam is not None:
+        cam.start_recording()
 
     # Constant wind force (Newtons), applied at the drone's COM link
     wind_force = torch.tensor([[list(args.wind)]], device=gs.device, dtype=gs.tc_float)
@@ -202,10 +226,18 @@ def main() -> None:
         # Step physics
         scene.step()
 
+        # Capture a frame if recording
+        if cam is not None:
+            cam.render(rgb=True, depth=False, segmentation=False, normal=False)
+
         # Read and print state
         pos = drone.get_pos()[0].cpu().numpy()
         vel = drone.get_vel()[0].cpu().numpy()
         print(f"{step:04d}: position={pos}, velocity={vel}")
+
+    # Finalize recording
+    if cam is not None:
+        cam.stop_recording(save_to_filename=args.record, fps=int(args.fps))
 
 
 if __name__ == "__main__":
