@@ -1,48 +1,57 @@
-"""Drone flight simulation under wind using Genesis.
+"""Drone flight under constant wind using Genesis.
 
-This example demonstrates how to extend a basic Genesis quadrotor example by
-applying a constant wind force. The script will create a simulation, spawn a
-simple quadrotor model, and step the physics while applying wind at each step.
-
-The code relies on the external ``genesis`` package. Install it via
-``pip install genesis-sim`` before running this example.
+This example uses the upstream Genesis API (Scene + Drone morph) to spawn a
+Crazyflie CF2X quadrotor and apply a constant wind force at each step.
 """
 
 from __future__ import annotations
 
 import numpy as np
+import torch
 
 try:
     import genesis as gs
 except ImportError as exc:  # pragma: no cover - library not installed in CI
     raise SystemExit(
-        "This example requires the 'genesis' package. Install it before running."
+        "This example requires the 'genesis' package (Genesis-Embodied-AI)."
     ) from exc
 
 
 def main() -> None:
-    """Run the wind‑affected drone simulation."""
+    # Initialize Genesis; default to CPU backend on Windows
+    # Use a simple theme to avoid Unicode box characters on some consoles
+    gs.init(backend=gs.cpu, theme="dumb")
 
-    # Create the Genesis simulation world with a 10 ms timestep
-    sim = gs.Simulation(dt=0.01)
+    # Create a scene with 10 ms timestep
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=0.01),
+        show_viewer=False,
+    )
 
-    # Spawn a basic quadrotor from the standard assets
-    drone = sim.create_quadrotor()
+    # Add a quadrotor (Crazyflie CF2X) from built-in assets
+    drone = scene.add_entity(gs.morphs.Drone(file="urdf/drones/cf2x.urdf"))
 
-    # Define a constant wind force vector (Newtons)
-    wind_force = np.array([2.0, 0.0, 0.0])
+    # Build the scene for a single environment
+    scene.build(n_envs=1)
 
-    # Run the simulation for 1000 steps
+    # Constant wind force (Newtons), applied at the drone's COM link
+    wind_force = torch.tensor([[[2.0, 0.0, 0.0]]], device=gs.device, dtype=gs.tc_float)
+    # Use the base link as application point
+    com_link = [drone.base_link_idx]
+
+    # Run the simulation
     for step in range(1000):
-        # Apply the wind force at the drone's center of mass
-        drone.apply_external_force(wind_force)
+        # Apply wind force to the COM link
+        scene.sim.rigid_solver.apply_links_external_force(
+            force=wind_force, links_idx=com_link, ref="link_com", local=False
+        )
 
-        # Advance the physics by one step
-        sim.step()
+        # Step physics
+        scene.step()
 
-        # Query and print the drone's current state
-        pos = drone.position()
-        vel = drone.velocity()
+        # Read and print state
+        pos = drone.get_pos()[0].cpu().numpy()
+        vel = drone.get_vel()[0].cpu().numpy()
         print(f"{step:04d}: position={pos}, velocity={vel}")
 
 
