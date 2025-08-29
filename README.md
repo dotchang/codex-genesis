@@ -82,5 +82,8 @@ Options:
 - `--plan-time T`: time budget for planning (sec), `--rrt-step s`: RRT step size (m)
 
 Notes:
-- Obstacles are also visualized as red spheres in the scene for context.
+- Obstacles are visualized in the scene:
+  - Spheres: red spheres
+  - Boxes (AABB): orange boxes
+  - Mesh files: blue AABB boxes (mesh bounds)
 - The resulting path is fed to the waypoint autopilot (`--auto`).

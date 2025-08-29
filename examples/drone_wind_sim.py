@@ -125,8 +125,19 @@ def main() -> None:
     parser.add_argument("--bounds", type=float, nargs=6, metavar=("MINX","MINY","MINZ","MAXX","MAXY","MAXZ"), default=(-2.0,-2.0,0.0, 2.0,2.0,2.0))
     parser.add_argument("--obs-sphere", type=float, nargs=4, action="append", metavar=("X","Y","Z","R"), help="Spherical obstacle (m)")
     parser.add_argument("--obs-margin", type=float, default=0.0, help="Safety margin added to obstacle radii (m)")
+    parser.add_argument("--obs-box", type=float, nargs=6, action="append", metavar=("CX","CY","CZ","SX","SY","SZ"), help="Axis-aligned box obstacle: center + size (m)")
+    parser.add_argument("--obs-mesh", type=str, action="append", help="Mesh obstacle filepath (approximated by AABB for planning)")
     parser.add_argument("--plan-time", type=float, default=2.0, help="Planning time budget (s) for OMPL/RRT")
     parser.add_argument("--rrt-step", type=float, default=0.2, help="RRT step size (m)")
+    parser.add_argument("--rrt-smooth", type=int, default=100, help="RRT shortcut smoothing trials")
+
+    # Autopilot yaw behavior
+    parser.add_argument('--yaw-face', dest='yaw_face', action='store_true')
+    parser.add_argument('--no-yaw-face', dest='yaw_face', action='store_false')
+    parser.set_defaults(yaw_face=True)
+    # Speed cap and PID presets
+    parser.add_argument('--speed-max', type=float, default=1.5, help='Max commanded speed magnitude (m/s)')
+    parser.add_argument('--pid-preset', choices=['gentle','hover','aggressive'], help='Preset PID gain set')
 
     # Light rain parameters
     parser.add_argument("--rain-down", type=float, default=0.8, help="Downward rain force magnitude (N)")
@@ -273,6 +284,51 @@ def main() -> None:
             except Exception:
                 # fallback without custom surface
                 scene.add_entity(gs.morphs.Sphere(radius=r, pos=(x, y, z), fixed=True, collision=False))
+
+    # Visualize AABB box obstacles
+    if args.obs_box:
+        for (cx, cy, cz, sx, sy, sz) in args.obs_box:
+            try:
+                x, y, z = float(cx), float(cy), float(cz)
+                sx, sy, sz = float(sx), float(sy), float(sz)
+            except Exception:
+                continue
+            try:
+                scene.add_entity(
+                    gs.morphs.Box(size=(sx, sy, sz), pos=(x, y, z), fixed=True, collision=False),
+                    surface=gs.surfaces.Rough(
+                        diffuse_texture=gs.textures.ColorTexture(color=(1.0, 0.6, 0.2))
+                    ),
+                )
+            except Exception:
+                scene.add_entity(gs.morphs.Box(size=(sx, sy, sz), pos=(x, y, z), fixed=True, collision=False))
+
+    # Visualize mesh AABB obstacles (as boxes)
+    if args.obs_mesh:
+        try:
+            import trimesh as _tm_viz
+        except Exception:
+            _tm_viz = None
+        if _tm_viz is not None:
+            for mpath in args.obs_mesh:
+                try:
+                    m = _tm_viz.load(mpath, force='mesh')
+                    if isinstance(m, _tm_viz.Trimesh):
+                        mn, mx = m.bounds
+                    elif isinstance(m, _tm_viz.Scene):
+                        mn, mx = m.bounds
+                    else:
+                        continue
+                    cx, cy, cz = (mn + mx) * 0.5
+                    sx, sy, sz = (mx - mn)
+                    scene.add_entity(
+                        gs.morphs.Box(size=(float(sx), float(sy), float(sz)), pos=(float(cx), float(cy), float(cz)), fixed=True, collision=False),
+                        surface=gs.surfaces.Rough(
+                            diffuse_texture=gs.textures.ColorTexture(color=(0.2, 0.6, 1.0))
+                        ),
+                    )
+                except Exception:
+                    continue
 
     # Build the scene for a single environment
     scene.build(n_envs=1)
@@ -502,6 +558,11 @@ def main() -> None:
             ctrl['pos'][1].step(float(err_pos[1]), dt),
             ctrl['pos'][2].step(float(err_pos[2]), dt),
         ], device=gs.device, dtype=gs.tc_float)
+        # speed cap
+        vmax = float(args.speed_max)
+        spd = torch.linalg.norm(vel_des)
+        if spd > vmax:
+            vel_des = vel_des * (vmax / spd)
         err_vel = vel_des - vel
         vel_del = torch.tensor([
             ctrl['vel'][0].step(float(err_vel[0]), dt),
@@ -537,6 +598,20 @@ def main() -> None:
         return torch.clamp(rpms, 0.0, 22000.0)
 
     _waypoints = _load_waypoints()
+    # PID preset application
+    if args.pid_preset:
+        if args.pid_preset == 'gentle':
+            args.pid_pos = (0.8, 0.0, 0.5)
+            args.pid_vel = (0.4, 0.0, 0.2)
+            args.pid_att = (0.10, 0.0, 0.04)
+        elif args.pid_preset == 'hover':
+            args.pid_pos = (1.2, 0.0, 0.8)
+            args.pid_vel = (0.6, 0.0, 0.3)
+            args.pid_att = (0.15, 0.0, 0.05)
+        elif args.pid_preset == 'aggressive':
+            args.pid_pos = (2.0, 0.0, 1.2)
+            args.pid_vel = (1.0, 0.0, 0.5)
+            args.pid_att = (0.25, 0.0, 0.08)
     # Optional planning: from current position to last provided waypoint
     if args.plan != 'none':
         if not _waypoints:
@@ -550,6 +625,29 @@ def main() -> None:
         if args.obs_sphere:
             for o in args.obs_sphere:
                 spheres.append(tuple(map(float,o)))  # (x,y,z,r)
+        boxes = []  # (cx,cy,cz,sx,sy,sz)
+        if args.obs_box:
+            for b in args.obs_box:
+                boxes.append(tuple(map(float,b)))
+        mesh_aabbs = []  # (minx,miny,minz,maxx,maxy,maxz)
+        if args.obs_mesh:
+            try:
+                import trimesh as _tm
+            except Exception:
+                _tm = None
+            if _tm is not None:
+                for mpath in args.obs_mesh:
+                    try:
+                        m = _tm.load(mpath, force='mesh')
+                        if isinstance(m, _tm.Trimesh):
+                            mn,mx = m.bounds
+                        elif isinstance(m, _tm.Scene):
+                            mn,mx = m.bounds
+                        else:
+                            continue
+                        mesh_aabbs.append((float(mn[0]),float(mn[1]),float(mn[2]),float(mx[0]),float(mx[1]),float(mx[2])))
+                    except Exception:
+                        continue
 
         def seg_free(a: torch.Tensor, b: torch.Tensor) -> bool:
             # check segment-sphere intersection (discretized)
@@ -561,6 +659,15 @@ def main() -> None:
                     return False
                 for (cx,cy,cz,cr) in spheres:
                     if torch.linalg.norm(p - torch.tensor([cx,cy,cz], device=gs.device, dtype=gs.tc_float)) < (cr + float(args.obs_margin)):
+                        return False
+                # AABB boxes
+                for (cx,cy,cz,sx,sy,sz) in boxes:
+                    hx,hy,hz = sx*0.5 + float(args.obs_margin), sy*0.5 + float(args.obs_margin), sz*0.5 + float(args.obs_margin)
+                    if (abs(p[0]-cx)<=hx) and (abs(p[1]-cy)<=hy) and (abs(p[2]-cz)<=hz):
+                        return False
+                # Mesh AABB
+                for (mnx,mny,mnz,mxx,mxy,mxz) in mesh_aabbs:
+                    if (mnx-float(args.obs_margin)<=p[0]<=mxx+float(args.obs_margin) and mny-float(args.obs_margin)<=p[1]<=mxy+float(args.obs_margin) and mnz-float(args.obs_margin)<=p[2]<=mxz+float(args.obs_margin)):
                         return False
             return True
 
@@ -605,7 +712,7 @@ def main() -> None:
                 path = list(reversed(path))
                 # optional shortcut smoothing
                 import random
-                for _ in range(100):
+                for _ in range(int(args.rrt_smooth)):
                     if len(path) < 3: break
                     i = random.randrange(0, len(path)-2)
                     j = random.randrange(i+2, len(path))
