@@ -74,7 +74,8 @@ def main() -> None:
     parser.add_argument("--wind-grid-origin", type=float, nargs=3, metavar=("OX", "OY", "OZ"), default=(-40.0, -40.0, 0.0))
     parser.add_argument("--wind-grid-default", type=float, nargs=3, metavar=("GX", "GY", "GZ"), default=(2.0, 0.0, 0.0))
     parser.add_argument("--wind-grid-file", type=str, help="Path to npz/json defining wind field (shape [NX,NY,NZ,3])")
-    parser.add_argument("--wind-grid-interp", choices=["nearest", "linear"], default="linear")
+    parser.add_argument("--wind-grid-interp", choices=["nearest", "linear", "idwdir"], default="linear")
+    parser.add_argument("--wind-idw-power", type=float, default=2.0, help="IDW power for 'idwdir' interpolation")
     parser.add_argument("--wind-grid-scale", type=float, default=1.0, help="Scale factor applied to loaded/grid vectors")
     # Noise parameters
     parser.add_argument("--wind-noise-amp", type=float, default=2.0, help="Amplitude for noise mode (N)")
@@ -294,6 +295,47 @@ def main() -> None:
                 iy = torch.clamp(torch.round(g[:, 1]).to(torch.int64), 0, ny - 1)
                 iz = torch.clamp(torch.round(g[:, 2]).to(torch.int64), 0, nz - 1)
                 return wind_grid[ix, iy, iz, :]
+            if args.wind_grid_interp == "idwdir":
+                # 8 neighbor node indices
+                x = torch.clamp(g[:, 0], 0.0, nx - 1.000001)
+                y = torch.clamp(g[:, 1], 0.0, ny - 1.000001)
+                z = torch.clamp(g[:, 2], 0.0, nz - 1.000001)
+                x0 = torch.floor(x).to(torch.int64); x1 = torch.clamp(x0 + 1, 0, nx - 1)
+                y0 = torch.floor(y).to(torch.int64); y1 = torch.clamp(y0 + 1, 0, ny - 1)
+                z0 = torch.floor(z).to(torch.int64); z1 = torch.clamp(z0 + 1, 0, nz - 1)
+
+                v000 = wind_grid[x0, y0, z0, :]
+                v100 = wind_grid[x1, y0, z0, :]
+                v010 = wind_grid[x0, y1, z0, :]
+                v110 = wind_grid[x1, y1, z0, :]
+                v001 = wind_grid[x0, y0, z1, :]
+                v101 = wind_grid[x1, y0, z1, :]
+                v011 = wind_grid[x0, y1, z1, :]
+                v111 = wind_grid[x1, y1, z1, :]
+                V = torch.stack([v000, v100, v010, v110, v001, v101, v011, v111], dim=1)  # (B,8,3)
+
+                idxs = torch.stack([
+                    torch.stack([x0, y0, z0], dim=1),
+                    torch.stack([x1, y0, z0], dim=1),
+                    torch.stack([x0, y1, z0], dim=1),
+                    torch.stack([x1, y1, z0], dim=1),
+                    torch.stack([x0, y0, z1], dim=1),
+                    torch.stack([x1, y0, z1], dim=1),
+                    torch.stack([x0, y1, z1], dim=1),
+                    torch.stack([x1, y1, z1], dim=1),
+                ], dim=1)  # (B,8,3)
+                node_pos = grid_origin + idxs.to(grid_spacing.dtype) * grid_spacing  # (B,8,3)
+
+                eps = 1e-6
+                d = torch.linalg.norm(pos_b3.unsqueeze(1) - node_pos, dim=2).clamp_min(eps)  # (B,8)
+                w = (1.0 / (d ** float(args.wind_idw_power))).unsqueeze(2)  # (B,8,1)
+
+                mag = torch.linalg.norm(V, dim=2)  # (B,8)
+                dir = V / (mag.unsqueeze(2).clamp_min(eps))  # (B,8,3)
+                mag_i = (w.squeeze(2) * mag).sum(dim=1) / w.squeeze(2).sum(dim=1).clamp_min(eps)  # (B,)
+                dir_i = (w * dir).sum(dim=1)
+                dir_i = dir_i / torch.linalg.norm(dir_i, dim=1, keepdim=True).clamp_min(eps)  # (B,3)
+                return dir_i * mag_i.unsqueeze(1)
             # linear
             x = torch.clamp(g[:, 0], 0.0, nx - 1.000001)
             y = torch.clamp(g[:, 1], 0.0, ny - 1.000001)
