@@ -74,7 +74,11 @@ def main() -> None:
     parser.add_argument("--wind-grid-origin", type=float, nargs=3, metavar=("OX", "OY", "OZ"), default=(-40.0, -40.0, 0.0))
     parser.add_argument("--wind-grid-default", type=float, nargs=3, metavar=("GX", "GY", "GZ"), default=(2.0, 0.0, 0.0))
     parser.add_argument("--wind-grid-file", type=str, help="Path to npz/json defining wind field (shape [NX,NY,NZ,3])")
-    parser.add_argument("--wind-grid-interp", choices=["nearest", "linear", "idwdir"], default="linear")
+    parser.add_argument(
+        "--wind-grid-interp",
+        choices=["nearest", "linear", "idwdir", "idwdir4"],
+        default="linear",
+    )
     parser.add_argument("--wind-idw-power", type=float, default=2.0, help="IDW power for 'idwdir' interpolation")
     parser.add_argument("--wind-grid-scale", type=float, default=1.0, help="Scale factor applied to loaded/grid vectors")
     # Noise parameters
@@ -285,8 +289,9 @@ def main() -> None:
         grid_origin = torch.tensor(list(args.wind_grid_origin), device=gs.device, dtype=gs.tc_float)
         grid_spacing = torch.tensor(list(args.wind_grid_spacing), device=gs.device, dtype=gs.tc_float)
 
-        def sample_wind_at(pos_b3: torch.Tensor) -> torch.Tensor:
-            """Trilinear/nearest sampling from wind_grid at world positions (B,3). Returns (B,3)."""
+        def sample_wind_at(pos_b3: torch.Tensor, heading_b3: torch.Tensor | None = None) -> torch.Tensor:
+            """Sampling wind at world positions (B,3). Returns (B,3).
+            Modes: nearest, linear, idwdir (8-node IDW on mag+dir), idwdir4 (2x2 at nearest-Z using heading)."""
             # map to grid coords
             g = (pos_b3 - grid_origin) / grid_spacing.clamp_min(1e-6)
             nx, ny, nz = wind_grid.shape[:3]
@@ -336,6 +341,48 @@ def main() -> None:
                 dir_i = (w * dir).sum(dim=1)
                 dir_i = dir_i / torch.linalg.norm(dir_i, dim=1, keepdim=True).clamp_min(eps)  # (B,3)
                 return dir_i * mag_i.unsqueeze(1)
+            if args.wind_grid_interp == "idwdir4":
+                # 2x2 neighbors on nearest Z plane, selected relative to heading
+                x = torch.clamp(g[:, 0], 0.0, nx - 1.000001)
+                y = torch.clamp(g[:, 1], 0.0, ny - 1.000001)
+                z = torch.clamp(g[:, 2], 0.0, nz - 1.000001)
+                x0 = torch.floor(x).to(torch.int64)
+                y0 = torch.floor(y).to(torch.int64)
+                z_near = torch.clamp(torch.round(z).to(torch.int64), 0, nz - 1)
+
+                if heading_b3 is None:
+                    heading_b3 = torch.zeros_like(pos_b3); heading_b3[:, 0] = 1.0
+                hx = heading_b3[:, 0]
+                hy = heading_b3[:, 1]
+                xi0 = torch.where(hx >= 0, x0, torch.clamp(x0 - 1, 0, nx - 1))
+                xi1 = torch.where(hx >= 0, torch.clamp(x0 + 1, 0, nx - 1), x0)
+                yi0 = torch.where(hy >= 0, y0, torch.clamp(y0 - 1, 0, ny - 1))
+                yi1 = torch.where(hy >= 0, torch.clamp(y0 + 1, 0, ny - 1), y0)
+
+                v00 = wind_grid[xi0, yi0, z_near, :]
+                v10 = wind_grid[xi1, yi0, z_near, :]
+                v01 = wind_grid[xi0, yi1, z_near, :]
+                v11 = wind_grid[xi1, yi1, z_near, :]
+                V = torch.stack([v00, v10, v01, v11], dim=1)  # (B,4,3)
+
+                idxs = torch.stack([
+                    torch.stack([xi0, yi0, z_near], dim=1),
+                    torch.stack([xi1, yi0, z_near], dim=1),
+                    torch.stack([xi0, yi1, z_near], dim=1),
+                    torch.stack([xi1, yi1, z_near], dim=1),
+                ], dim=1)  # (B,4,3)
+                node_pos = grid_origin + idxs.to(grid_spacing.dtype) * grid_spacing  # (B,4,3)
+
+                eps = 1e-6
+                d = torch.linalg.norm(pos_b3.unsqueeze(1) - node_pos, dim=2).clamp_min(eps)  # (B,4)
+                w = (1.0 / (d ** float(args.wind_idw_power))).unsqueeze(2)  # (B,4,1)
+
+                mag = torch.linalg.norm(V, dim=2)  # (B,4)
+                dir = V / (mag.unsqueeze(2).clamp_min(eps))  # (B,4,3)
+                mag_i = (w.squeeze(2) * mag).sum(dim=1) / w.squeeze(2).sum(dim=1).clamp_min(eps)  # (B,)
+                dir_i = (w * dir).sum(dim=1)
+                dir_i = dir_i / torch.linalg.norm(dir_i, dim=1, keepdim=True).clamp_min(eps)  # (B,3)
+                return dir_i * mag_i.unsqueeze(1)
             # linear
             x = torch.clamp(g[:, 0], 0.0, nx - 1.000001)
             y = torch.clamp(g[:, 1], 0.0, ny - 1.000001)
@@ -375,6 +422,8 @@ def main() -> None:
     com_link = [drone.base_link_idx]
 
     # Run the simulation
+    last_heading = torch.zeros((1, 3), device=gs.device, dtype=gs.tc_float)
+    last_heading[0, 0] = 1.0
     for step in range(int(args.steps)):
         # Wind force application (const/grid/noise)
         if args.wind_mode == "const":
@@ -382,7 +431,19 @@ def main() -> None:
         else:
             # sample at current drone COM (use entity position as proxy)
             pos_b3 = drone.get_pos()  # (B,3)
-            wf_b3 = sample_wind_at(pos_b3)
+            wf_b3 = None
+            if args.wind_grid_interp == "idwdir4":
+                vel_b3 = drone.get_vel()
+                spd = torch.linalg.norm(vel_b3, dim=1, keepdim=True)
+                heading_b3 = torch.where(
+                    spd > 1e-6,
+                    vel_b3 / spd,
+                    last_heading.expand_as(vel_b3),
+                )
+                last_heading = heading_b3.detach()
+                wf_b3 = sample_wind_at(pos_b3, heading_b3)
+            else:
+                wf_b3 = sample_wind_at(pos_b3)
             wf = wf_b3.unsqueeze(1).contiguous()
         scene.sim.rigid_solver.apply_links_external_force(force=wf, links_idx=com_link, ref="link_com", local=False)
 
