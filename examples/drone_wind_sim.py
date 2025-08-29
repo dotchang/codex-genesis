@@ -255,6 +255,24 @@ def main() -> None:
         for c in cams:
             c.follow_entity(drone, fixed_axis=fixed_axis, smoothing=float(args.follow_smooth), fix_orientation=False)
 
+    # Visualize spherical obstacles if any (add BEFORE build)
+    if args.obs_sphere:
+        for (ox, oy, oz, orad) in args.obs_sphere:
+            try:
+                x, y, z, r = float(ox), float(oy), float(oz), float(orad)
+            except Exception:
+                continue
+            try:
+                scene.add_entity(
+                    gs.morphs.Sphere(radius=r, pos=(x, y, z), fixed=True, collision=False),
+                    surface=gs.surfaces.Rough(
+                        diffuse_texture=gs.textures.ColorTexture(color=(1.0, 0.2, 0.2))
+                    ),
+                )
+            except Exception:
+                # fallback without custom surface
+                scene.add_entity(gs.morphs.Sphere(radius=r, pos=(x, y, z), fixed=True, collision=False))
+
     # Build the scene for a single environment
     scene.build(n_envs=1)
     # Start recording if requested

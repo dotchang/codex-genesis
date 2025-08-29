@@ -65,3 +65,22 @@ Usage:
 - Manual offset: `--offset 1000 2000 0`
 - Record: `--record city.mp4 --fps 60 --res 1280 720`
 - Snapshots: `--snap-dir snaps --snap-interval 20`
+### Obstacle-Aware Path Planning
+- Built-in RRT planner (default fallback) and optional OMPL (if available).
+- Spherical obstacles and a planning bounding box can be specified via CLI.
+
+Examples:
+- Plan with RRT and a single spherical obstacle, then fly with autopilot:
+  - `python examples\drone_wind_sim.py --auto --plan rrt --bounds -1 -1 0 2 2 1.5 --obs-sphere 0.5 0.0 0.5 0.25 --wp 1.2 0 0.5 --steps 1500 --quiet`
+- Use OMPL (if installed, e.g., via conda-forge) for planning:
+  - `python examples\drone_wind_sim.py --auto --plan ompl --bounds -2 -2 0 2 2 2 --obs-sphere 0.0 0.5 0.5 0.3 --wp 1.5 0 0.5 --steps 1500 --quiet`
+
+Options:
+- `--plan {none,rrt,ompl}`: choose planner (fallback is RRT if OMPL not present)
+- `--bounds minx miny minz maxx maxy maxz`: planning workspace bounds
+- `--obs-sphere x y z r`: add spherical obstacle (repeatable)
+- `--plan-time T`: time budget for planning (sec), `--rrt-step s`: RRT step size (m)
+
+Notes:
+- Obstacles are also visualized as red spheres in the scene for context.
+- The resulting path is fed to the waypoint autopilot (`--auto`).
