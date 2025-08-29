@@ -110,6 +110,16 @@ def main() -> None:
         help="Fix camera Z while following (omit to follow in Z as well)",
     )
 
+    # Waypoint autopilot (simple PID-based)
+    parser.add_argument("--auto", action="store_true", help="Enable waypoint autopilot")
+    parser.add_argument("--wp", type=float, nargs=3, action="append", metavar=("X","Y","Z"), help="Waypoint")
+    parser.add_argument("--wp-file", type=str, help="JSON file with [[x,y,z], ...]")
+    parser.add_argument("--wp-radius", type=float, default=0.25, help="Waypoint acceptance radius (m)")
+    parser.add_argument("--base-rpm", type=float, default=14500.0, help="Base RPM hover around ~14.5k")
+    parser.add_argument("--pid-pos", type=float, nargs=3, default=(1.2, 0.0, 0.8), help="PID gains kp ki kd for position loop (applies per-axis)")
+    parser.add_argument("--pid-vel", type=float, nargs=3, default=(0.6, 0.0, 0.3), help="PID gains kp ki kd for velocity loop (applies per-axis)")
+    parser.add_argument("--pid-att", type=float, nargs=3, default=(0.15, 0.0, 0.05), help="PID gains kp ki kd for attitude (roll/pitch/yaw) loop")
+
     # Light rain parameters
     parser.add_argument("--rain-down", type=float, default=0.8, help="Downward rain force magnitude (N)")
     parser.add_argument("--drag", type=float, default=0.0, help="Linear drag coefficient (N·s/m), 0 disables")
@@ -421,6 +431,87 @@ def main() -> None:
     # Use the base link as application point
     com_link = [drone.base_link_idx]
 
+    # Waypoints autopilot setup
+    def _load_waypoints() -> list[torch.Tensor]:
+        wps: list[torch.Tensor] = []
+        if args.wp_file:
+            with open(args.wp_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            for p in data:
+                wps.append(torch.tensor(p, device=gs.device, dtype=gs.tc_float))
+        if args.wp:
+            for w in args.wp:
+                wps.append(torch.tensor(w, device=gs.device, dtype=gs.tc_float))
+        return wps
+
+    class _PID:
+        def __init__(self, kp, ki, kd):
+            self.kp, self.ki, self.kd = float(kp), float(ki), float(kd)
+            self.i = 0.0
+            self.prev = 0.0
+        def step(self, err, dt):
+            self.i += err * dt
+            d = (err - self.prev) / dt
+            self.prev = err
+            return self.kp * err + self.ki * self.i + self.kd * d
+
+    def _make_ctrl(dt, base_rpm, kpki_kd_pos, kpki_kd_vel, kpki_kd_att):
+        return {
+            'dt': dt,
+            'base': float(base_rpm),
+            'pos': [_PID(*kpki_kd_pos), _PID(*kpki_kd_pos), _PID(*kpki_kd_pos)],
+            'vel': [_PID(*kpki_kd_vel), _PID(*kpki_kd_vel), _PID(*kpki_kd_vel)],
+            'att': [_PID(*kpki_kd_att), _PID(*kpki_kd_att), _PID(*kpki_kd_att)],
+        }
+
+    def _ctrl_step(ctrl, drone_entity, target_xyz):
+        dt = ctrl['dt']
+        pos = drone_entity.get_pos()[0]
+        vel = drone_entity.get_vel()[0]
+        quat = drone_entity.get_quat()[0]
+        att = gs.utils.geom.quat_to_xyz(quat.unsqueeze(0), rpy=True, degrees=True)[0]
+        err_pos = target_xyz - pos
+        vel_des = torch.tensor([
+            ctrl['pos'][0].step(float(err_pos[0]), dt),
+            ctrl['pos'][1].step(float(err_pos[1]), dt),
+            ctrl['pos'][2].step(float(err_pos[2]), dt),
+        ], device=gs.device, dtype=gs.tc_float)
+        err_vel = vel_des - vel
+        vel_del = torch.tensor([
+            ctrl['vel'][0].step(float(err_vel[0]), dt),
+            ctrl['vel'][1].step(float(err_vel[1]), dt),
+            ctrl['vel'][2].step(float(err_vel[2]), dt),
+        ], device=gs.device, dtype=gs.tc_float)
+        att_del = torch.tensor([
+            ctrl['att'][0].step(float(-att[0]), dt),
+            ctrl['att'][1].step(float(-att[1]), dt),
+            ctrl['att'][2].step(float(-att[2]), dt),
+        ], device=gs.device, dtype=gs.tc_float)
+        thrust = vel_del[2]
+        roll = att_del[0]
+        pitch = att_del[1]
+        yaw = att_del[2]
+        x_vel = vel_del[0]
+        y_vel = vel_del[1]
+        base = ctrl['base']
+        m1 = base + (thrust - roll - pitch - yaw - x_vel + y_vel)
+        m2 = base + (thrust - roll + pitch + yaw + x_vel + y_vel)
+        m3 = base + (thrust + roll + pitch - yaw + x_vel - y_vel)
+        m4 = base + (thrust + roll - pitch + yaw - x_vel - y_vel)
+        rpms = torch.stack([m1, m2, m3, m4])
+        return torch.clamp(rpms, 0.0, 22000.0)
+
+    _waypoints = _load_waypoints()
+    _wp_idx = 0
+    _wp_tol = float(args.wp_radius)
+    _ctrl = _make_ctrl(
+        dt=0.01,
+        base_rpm=float(args.base_rpm),
+        kpki_kd_pos=tuple(args.pid_pos),
+        kpki_kd_vel=tuple(args.pid_vel),
+        kpki_kd_att=tuple(args.pid_att),
+    ) if args.auto and _waypoints else None
+
     # Run the simulation
     last_heading = torch.zeros((1, 3), device=gs.device, dtype=gs.tc_float)
     last_heading[0, 0] = 1.0
@@ -470,6 +561,17 @@ def main() -> None:
                     direction=emit_cfg["direction"],
                     speed=float(args.sph_speed),
                 )
+
+        # Simple waypoint controller
+        if _ctrl is not None and _wp_idx < len(_waypoints):
+            tgt = _waypoints[_wp_idx]
+            pos_now = drone.get_pos()[0]
+            if torch.linalg.norm(tgt - pos_now) < _wp_tol:
+                _wp_idx += 1
+            else:
+                rpms = _ctrl_step(_ctrl, drone, tgt)
+                # expect (B,N) -> make (1,4)
+                drone.set_propellels_rpm(rpms.unsqueeze(0))
 
         # Step physics
         scene.step()
