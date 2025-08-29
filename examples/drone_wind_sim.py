@@ -157,6 +157,13 @@ def main() -> None:
     parser.add_argument('--viz-color-sphere', type=float, nargs=3, default=(1.0, 0.2, 0.2))
     parser.add_argument('--viz-color-box', type=float, nargs=3, default=(1.0, 0.6, 0.2))
     parser.add_argument('--viz-color-mesh', type=float, nargs=3, default=(0.2, 0.6, 1.0))
+    # Path polyline visualization
+    parser.add_argument('--viz-path', action='store_true', help='Visualize planned path as small spheres')
+    parser.add_argument('--viz-path-step', type=int, default=1, help='Subsample path points (>=1)')
+    parser.add_argument('--viz-path-radius', type=float, default=0.03, help='Sphere radius for path markers (m)')
+    parser.add_argument('--viz-color-path', type=float, nargs=3, default=(0.0, 1.0, 0.4))
+    parser.add_argument('--viz-path-alpha', type=float, default=0.8)
+    parser.add_argument('--start', type=float, nargs=3, metavar=("SX","SY","SZ"), help='Optional planning start position (m)')
 
     # Light rain parameters
     parser.add_argument("--rain-down", type=float, default=0.8, help="Downward rain force magnitude (N)")
@@ -285,6 +292,170 @@ def main() -> None:
         fixed_axis = (None, None, args.follow_fixed_z) if args.follow_fixed_z is not None else (None, None, None)
         for c in cams:
             c.follow_entity(drone, fixed_axis=fixed_axis, smoothing=float(args.follow_smooth), fix_orientation=False)
+
+    # ---------------- Pre-build planning & path visualization ----------------
+    planned_path: list[torch.Tensor] | None = None
+    if args.plan != 'none':
+        # Prepare obstacles lists for planning
+        minx,miny,minz,maxx,maxy,maxz = map(float, args.bounds)
+        spheres_plan = []
+        if args.obs_sphere:
+            for o in args.obs_sphere:
+                try:
+                    spheres_plan.append(tuple(map(float,o)))
+                except Exception:
+                    continue
+        boxes_plan = []
+        if args.obs_box:
+            for b in args.obs_box:
+                try:
+                    boxes_plan.append(tuple(map(float,b)))
+                except Exception:
+                    continue
+        mesh_aabbs_plan = []
+        if args.obs_mesh:
+            try:
+                import trimesh as _tm_pre
+            except Exception:
+                _tm_pre = None
+            if _tm_pre is not None:
+                for mpath in args.obs_mesh:
+                    try:
+                        m = _tm_pre.load(mpath, force='mesh')
+                        if isinstance(m, _tm_pre.Trimesh):
+                            mn, mx = m.bounds
+                        elif isinstance(m, _tm_pre.Scene):
+                            mn, mx = m.bounds
+                        else:
+                            continue
+                        mesh_aabbs_plan.append((float(mn[0]),float(mn[1]),float(mn[2]),float(mx[0]),float(mx[1]),float(mx[2])))
+                    except Exception:
+                        continue
+
+        def seg_free_pre(a: torch.Tensor, b: torch.Tensor) -> bool:
+            n = max(2, int(torch.linalg.norm(b-a).item()/ (args.rrt_step*0.5)))
+            for i in range(n+1):
+                p = a + (b-a)*(i/ max(1,n))
+                if not (minx<=p[0]<=maxx and miny<=p[1]<=maxy and minz<=p[2]<=maxz):
+                    return False
+                for (cx,cy,cz,cr) in spheres_plan:
+                    if torch.linalg.norm(p - torch.tensor([cx,cy,cz], device=gs.device, dtype=gs.tc_float)) < (cr + float(args.obs_margin)):
+                        return False
+                for (cx,cy,cz,sx,sy,sz) in boxes_plan:
+                    hx,hy,hz = sx*0.5 + float(args.obs_margin), sy*0.5 + float(args.obs_margin), sz*0.5 + float(args.obs_margin)
+                    if (abs(p[0]-cx)<=hx) and (abs(p[1]-cy)<=hy) and (abs(p[2]-cz)<=hz):
+                        return False
+                for (mnx,mny,mnz,mxx,mxy,mxz) in mesh_aabbs_plan:
+                    if (mnx-float(args.obs_margin)<=p[0]<=mxx+float(args.obs_margin) and mny-float(args.obs_margin)<=p[1]<=mxy+float(args.obs_margin) and mnz-float(args.obs_margin)<=p[2]<=mxz+float(args.obs_margin)):
+                        return False
+            return True
+
+        # Decide start/goal for pre-build planning
+        if args.start:
+            start_pos_pre = torch.tensor(list(args.start), device=gs.device, dtype=gs.tc_float)
+        else:
+            start_pos_pre = torch.tensor([0.0,0.0,0.0], device=gs.device, dtype=gs.tc_float)
+        # goal: if user provided waypoints, use last; else a nominal goal
+        goal_pos_pre = None
+        if args.wp_file or args.wp:
+            # we'll parse here lightweight
+            last_wp = None
+            if args.wp_file:
+                try:
+                    with open(args.wp_file,'r',encoding='utf-8') as f:
+                        data = json.load(f)
+                        if isinstance(data,list) and len(data)>0:
+                            last_wp = data[-1]
+                except Exception:
+                    pass
+            if args.wp:
+                last_wp = args.wp[-1]
+            if last_wp is not None:
+                goal_pos_pre = torch.tensor(list(map(float,last_wp)), device=gs.device, dtype=gs.tc_float)
+        if goal_pos_pre is None:
+            goal_pos_pre = start_pos_pre + torch.tensor([1.0,0.0,0.5], device=gs.device, dtype=gs.tc_float)
+
+        planned_path = []
+        if args.plan == 'rrt':
+            import random, time
+            step = float(args.rrt_step)
+            t0 = time.time()
+            nodes = [start_pos_pre.clone()]
+            parents = [-1]
+            goal_reached = False
+            while time.time()-t0 < float(args.plan_time):
+                s = goal_pos_pre if random.random()<0.2 else torch.tensor([random.uniform(minx,maxx), random.uniform(miny,maxy), random.uniform(minz,maxz)], device=gs.device, dtype=gs.tc_float)
+                d = torch.stack([torch.linalg.norm(n-s) for n in nodes])
+                i = int(torch.argmin(d))
+                q = nodes[i]
+                dir = s - q
+                L = torch.linalg.norm(dir).item()
+                if L<1e-6: continue
+                dir /= L
+                new = q + dir*step
+                if seg_free_pre(q,new):
+                    nodes.append(new); parents.append(i)
+                    if torch.linalg.norm(new-goal_pos_pre) < step*1.5 and seg_free_pre(new, goal_pos_pre):
+                        nodes.append(goal_pos_pre); parents.append(len(nodes)-2); goal_reached=True; break
+            if goal_reached:
+                idx = len(nodes)-1; path=[]
+                while idx!=-1:
+                    path.append(nodes[idx]); idx = parents[idx]
+                path = list(reversed(path))
+                # shortcut smoothing
+                for _ in range(int(args.rrt_smooth)):
+                    if len(path)<3: break
+                    i = random.randrange(0,len(path)-2)
+                    j = random.randrange(i+2, len(path))
+                    if seg_free_pre(path[i], path[j]):
+                        path = path[:i+1] + path[j:]
+                planned_path = path
+        elif args.plan == 'ompl':
+            try:
+                from ompl import base as ob, geometric as og
+                space = ob.RealVectorStateSpace(3)
+                bounds = ob.RealVectorBounds(3)
+                bounds.setLow(0, minx); bounds.setLow(1,miny); bounds.setLow(2,minz)
+                bounds.setHigh(0,maxx); bounds.setHigh(1,maxy); bounds.setHigh(2,maxz)
+                space.setBounds(bounds)
+                ss = og.SimpleSetup(space)
+                def isValid(state):
+                    x,y,z = state[0],state[1],state[2]
+                    for (cx,cy,cz,cr) in spheres_plan:
+                        if (x-cx)**2 + (y-cy)**2 + (z-cz)**2 < (cr+float(args.obs_margin))**2:
+                            return False
+                    for (cx,cy,cz,sx,sy,sz) in boxes_plan:
+                        hx,hy,hz = sx*0.5 + float(args.obs_margin), sy*0.5 + float(args.obs_margin), sz*0.5 + float(args.obs_margin)
+                        if (abs(x-cx)<=hx) and (abs(y-cy)<=hy) and (abs(z-cz)<=hz):
+                            return False
+                    for (mnx,mny,mnz,mxx,mxy,mxz) in mesh_aabbs_plan:
+                        if (mnx-float(args.obs_margin)<=x<=mxx+float(args.obs_margin) and mny-float(args.obs_margin)<=y<=mxy+float(args.obs_margin) and mnz-float(args.obs_margin)<=z<=mxz+float(args.obs_margin)):
+                            return False
+                    return True
+                ss.setStateValidityChecker(ob.StateValidityCheckerFn(isValid))
+                start = ob.State(space); start()[0]=float(start_pos_pre[0]); start()[1]=float(start_pos_pre[1]); start()[2]=float(start_pos_pre[2])
+                goal = ob.State(space); goal()[0]=float(goal_pos_pre[0]); goal()[1]=float(goal_pos_pre[1]); goal()[2]=float(goal_pos_pre[2])
+                ss.setStartAndGoalStates(start, goal)
+                ss.setPlanner(og.RRTConnect(ss.getSpaceInformation()))
+                ss.setup()
+                if ss.solve(float(args.plan_time)):
+                    path = ss.getSolutionPath(); path.interpolate(100)
+                    states = path.getStates()
+                    for st in states:
+                        planned_path.append(torch.tensor([st[0],st[1],st[2]], device=gs.device, dtype=gs.tc_float))
+            except Exception as e:
+                print('OMPL not available:', e)
+
+    # Visualize planned path as spheres
+    if planned_path and args.viz_path:
+        col = tuple(map(float, args.viz_color_path)); rgba=(col[0],col[1],col[2], float(args.viz_path_alpha))
+        step_n = max(1, int(args.viz_path_step)); r = float(args.viz_path_radius)
+        for idx, pt in enumerate(planned_path):
+            if idx % step_n != 0: continue
+            scene.add_entity(
+                gs.morphs.Sphere(radius=r, pos=tuple(pt.tolist()), fixed=True, collision=False),
+                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=rgba)),
+            )
 
     # Visualize spherical obstacles if any (add BEFORE build)
     if args.obs_sphere and args.viz_spheres:
