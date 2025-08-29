@@ -124,6 +124,7 @@ def main() -> None:
     parser.add_argument("--plan", choices=["none", "rrt", "ompl"], default="none", help="Plan path between first and last waypoint")
     parser.add_argument("--bounds", type=float, nargs=6, metavar=("MINX","MINY","MINZ","MAXX","MAXY","MAXZ"), default=(-2.0,-2.0,0.0, 2.0,2.0,2.0))
     parser.add_argument("--obs-sphere", type=float, nargs=4, action="append", metavar=("X","Y","Z","R"), help="Spherical obstacle (m)")
+    parser.add_argument("--obs-margin", type=float, default=0.0, help="Safety margin added to obstacle radii (m)")
     parser.add_argument("--plan-time", type=float, default=2.0, help="Planning time budget (s) for OMPL/RRT")
     parser.add_argument("--rrt-step", type=float, default=0.2, help="RRT step size (m)")
 
@@ -489,7 +490,7 @@ def main() -> None:
             'att': [_PID(*kpki_kd_att), _PID(*kpki_kd_att), _PID(*kpki_kd_att)],
         }
 
-    def _ctrl_step(ctrl, drone_entity, target_xyz):
+    def _ctrl_step(ctrl, drone_entity, target_xyz, yaw_face: bool = False):
         dt = ctrl['dt']
         pos = drone_entity.get_pos()[0]
         vel = drone_entity.get_vel()[0]
@@ -507,10 +508,19 @@ def main() -> None:
             ctrl['vel'][1].step(float(err_vel[1]), dt),
             ctrl['vel'][2].step(float(err_vel[2]), dt),
         ], device=gs.device, dtype=gs.tc_float)
+        # attitude targets: keep level roll/pitch; yaw -> face next waypoint if enabled
+        yaw_err_deg = -float(att[2])
+        if yaw_face:
+            dir_xy = (target_xyz - pos)
+            dir_len = math.hypot(float(dir_xy[0]), float(dir_xy[1]))
+            if dir_len > 1e-4:
+                yaw_des = math.degrees(math.atan2(float(dir_xy[1]), float(dir_xy[0])))
+                # shortest angle diff
+                yaw_err_deg = (yaw_des - float(att[2]) + 540.0) % 360.0 - 180.0
         att_del = torch.tensor([
             ctrl['att'][0].step(float(-att[0]), dt),
             ctrl['att'][1].step(float(-att[1]), dt),
-            ctrl['att'][2].step(float(-att[2]), dt),
+            ctrl['att'][2].step(yaw_err_deg, dt),
         ], device=gs.device, dtype=gs.tc_float)
         thrust = vel_del[2]
         roll = att_del[0]
@@ -550,7 +560,7 @@ def main() -> None:
                 if not (minx<=p[0]<=maxx and miny<=p[1]<=maxy and minz<=p[2]<=maxz):
                     return False
                 for (cx,cy,cz,cr) in spheres:
-                    if torch.linalg.norm(p - torch.tensor([cx,cy,cz], device=gs.device, dtype=gs.tc_float)) < cr:
+                    if torch.linalg.norm(p - torch.tensor([cx,cy,cz], device=gs.device, dtype=gs.tc_float)) < (cr + float(args.obs_margin)):
                         return False
             return True
 
@@ -593,6 +603,14 @@ def main() -> None:
                     path.append(nodes[idx])
                     idx = parents[idx]
                 path = list(reversed(path))
+                # optional shortcut smoothing
+                import random
+                for _ in range(100):
+                    if len(path) < 3: break
+                    i = random.randrange(0, len(path)-2)
+                    j = random.randrange(i+2, len(path))
+                    if seg_free(path[i], path[j]):
+                        path = path[:i+1] + path[j:]
                 planned = path
         elif args.plan == 'ompl':
             try:
