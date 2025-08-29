@@ -139,6 +139,25 @@ def main() -> None:
     parser.add_argument('--speed-max', type=float, default=1.5, help='Max commanded speed magnitude (m/s)')
     parser.add_argument('--pid-preset', choices=['gentle','hover','aggressive'], help='Preset PID gain set')
 
+    # Visualization toggles/colors
+    parser.add_argument('--viz-spheres', dest='viz_spheres', action='store_true')
+    parser.add_argument('--no-viz-spheres', dest='viz_spheres', action='store_false')
+    parser.set_defaults(viz_spheres=True)
+
+    parser.add_argument('--viz-boxes', dest='viz_boxes', action='store_true')
+    parser.add_argument('--no-viz-boxes', dest='viz_boxes', action='store_false')
+    parser.set_defaults(viz_boxes=True)
+
+    parser.add_argument('--viz-mesh-aabb', dest='viz_mesh_aabb', action='store_true')
+    parser.add_argument('--no-viz-mesh-aabb', dest='viz_mesh_aabb', action='store_false')
+    parser.set_defaults(viz_mesh_aabb=True)
+
+    parser.add_argument('--viz-mesh-solid', action='store_true', help='Also visualize full mesh geometry (heavier)')
+    parser.add_argument('--viz-alpha', type=float, default=0.35, help='Alpha for obstacle colors (0..1)')
+    parser.add_argument('--viz-color-sphere', type=float, nargs=3, default=(1.0, 0.2, 0.2))
+    parser.add_argument('--viz-color-box', type=float, nargs=3, default=(1.0, 0.6, 0.2))
+    parser.add_argument('--viz-color-mesh', type=float, nargs=3, default=(0.2, 0.6, 1.0))
+
     # Light rain parameters
     parser.add_argument("--rain-down", type=float, default=0.8, help="Downward rain force magnitude (N)")
     parser.add_argument("--drag", type=float, default=0.0, help="Linear drag coefficient (N·s/m), 0 disables")
@@ -268,17 +287,19 @@ def main() -> None:
             c.follow_entity(drone, fixed_axis=fixed_axis, smoothing=float(args.follow_smooth), fix_orientation=False)
 
     # Visualize spherical obstacles if any (add BEFORE build)
-    if args.obs_sphere:
+    if args.obs_sphere and args.viz_spheres:
         for (ox, oy, oz, orad) in args.obs_sphere:
             try:
                 x, y, z, r = float(ox), float(oy), float(oz), float(orad)
             except Exception:
                 continue
             try:
+                col = tuple(map(float, args.viz_color_sphere))
+                rgba = (col[0], col[1], col[2], float(args.viz_alpha))
                 scene.add_entity(
                     gs.morphs.Sphere(radius=r, pos=(x, y, z), fixed=True, collision=False),
                     surface=gs.surfaces.Rough(
-                        diffuse_texture=gs.textures.ColorTexture(color=(1.0, 0.2, 0.2))
+                        diffuse_texture=gs.textures.ColorTexture(color=rgba)
                     ),
                 )
             except Exception:
@@ -286,7 +307,7 @@ def main() -> None:
                 scene.add_entity(gs.morphs.Sphere(radius=r, pos=(x, y, z), fixed=True, collision=False))
 
     # Visualize AABB box obstacles
-    if args.obs_box:
+    if args.obs_box and args.viz_boxes:
         for (cx, cy, cz, sx, sy, sz) in args.obs_box:
             try:
                 x, y, z = float(cx), float(cy), float(cz)
@@ -294,17 +315,19 @@ def main() -> None:
             except Exception:
                 continue
             try:
+                col = tuple(map(float, args.viz_color_box))
+                rgba = (col[0], col[1], col[2], float(args.viz_alpha))
                 scene.add_entity(
                     gs.morphs.Box(size=(sx, sy, sz), pos=(x, y, z), fixed=True, collision=False),
                     surface=gs.surfaces.Rough(
-                        diffuse_texture=gs.textures.ColorTexture(color=(1.0, 0.6, 0.2))
+                        diffuse_texture=gs.textures.ColorTexture(color=rgba)
                     ),
                 )
             except Exception:
                 scene.add_entity(gs.morphs.Box(size=(sx, sy, sz), pos=(x, y, z), fixed=True, collision=False))
 
     # Visualize mesh AABB obstacles (as boxes)
-    if args.obs_mesh:
+    if args.obs_mesh and (args.viz_mesh_aabb or args.viz_mesh_solid):
         try:
             import trimesh as _tm_viz
         except Exception:
@@ -321,12 +344,25 @@ def main() -> None:
                         continue
                     cx, cy, cz = (mn + mx) * 0.5
                     sx, sy, sz = (mx - mn)
-                    scene.add_entity(
-                        gs.morphs.Box(size=(float(sx), float(sy), float(sz)), pos=(float(cx), float(cy), float(cz)), fixed=True, collision=False),
-                        surface=gs.surfaces.Rough(
-                            diffuse_texture=gs.textures.ColorTexture(color=(0.2, 0.6, 1.0))
-                        ),
-                    )
+                    if args.viz_mesh_aabb:
+                        col = tuple(map(float, args.viz_color_mesh))
+                        rgba = (col[0], col[1], col[2], float(args.viz_alpha))
+                        scene.add_entity(
+                            gs.morphs.Box(size=(float(sx), float(sy), float(sz)), pos=(float(cx), float(cy), float(cz)), fixed=True, collision=False),
+                            surface=gs.surfaces.Rough(
+                                diffuse_texture=gs.textures.ColorTexture(color=rgba)
+                            ),
+                        )
+                    if args.viz_mesh_solid:
+                        # Visualize full mesh geometry (heavier). Place at world coordinates.
+                        col = tuple(map(float, args.viz_color_mesh))
+                        rgba = (col[0], col[1], col[2], float(max(args.viz_alpha, 0.8)))
+                        scene.add_entity(
+                            gs.morphs.Mesh(file=str(mpath), fixed=True, collision=False),
+                            surface=gs.surfaces.Rough(
+                                diffuse_texture=gs.textures.ColorTexture(color=rgba)
+                            ),
+                        )
                 except Exception:
                     continue
 
