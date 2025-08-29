@@ -15,7 +15,9 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import math
 import os
 import numpy as np
 import torch
@@ -58,6 +60,25 @@ def main() -> None:
         "--wind", type=float, nargs=3, metavar=("WX", "WY", "WZ"), default=(2.0, 0.0, 0.0), help="Wind force (N)"
     )
     parser.add_argument("--quiet", action="store_true", help="Reduce logging (suppress INFO banners/emojis)")
+
+    # Wind field modes
+    parser.add_argument(
+        "--wind-mode",
+        choices=["const", "grid", "noise"],
+        default="const",
+        help="Wind model: const (uniform), grid (3D lattice), noise (procedural)",
+    )
+    # Grid parameters
+    parser.add_argument("--wind-grid-size", type=int, nargs=3, metavar=("NX", "NY", "NZ"), default=(8, 8, 4))
+    parser.add_argument("--wind-grid-spacing", type=float, nargs=3, metavar=("SX", "SY", "SZ"), default=(10.0, 10.0, 10.0))
+    parser.add_argument("--wind-grid-origin", type=float, nargs=3, metavar=("OX", "OY", "OZ"), default=(-40.0, -40.0, 0.0))
+    parser.add_argument("--wind-grid-default", type=float, nargs=3, metavar=("GX", "GY", "GZ"), default=(2.0, 0.0, 0.0))
+    parser.add_argument("--wind-grid-file", type=str, help="Path to npz/json defining wind field (shape [NX,NY,NZ,3])")
+    parser.add_argument("--wind-grid-interp", choices=["nearest", "linear"], default="linear")
+    parser.add_argument("--wind-grid-scale", type=float, default=1.0, help="Scale factor applied to loaded/grid vectors")
+    # Noise parameters
+    parser.add_argument("--wind-noise-amp", type=float, default=2.0, help="Amplitude for noise mode (N)")
+    parser.add_argument("--wind-noise-seed", type=int, default=0, help="RNG seed for noise mode")
 
     # Recording controls (offscreen camera)
     parser.add_argument("--record", type=str, help="Save an MP4 video to this path (e.g., out.mp4)")
@@ -219,8 +240,91 @@ def main() -> None:
         for c in cams:
             c.start_recording()
 
-    # Constant wind force (Newtons), applied at the drone's COM link
-    wind_force = torch.tensor([[list(args.wind)]], device=gs.device, dtype=gs.tc_float)
+    # Wind model setup
+    wind_const = torch.tensor([[list(args.wind)]], device=gs.device, dtype=gs.tc_float)
+
+    def load_wind_grid_from_file(path: str):
+        p = Path(path)
+        if p.suffix.lower() == ".npz":
+            data = np.load(p)
+            if "U" in data:
+                arr = np.array(data["U"], dtype=np.float32)
+            else:
+                # take first array
+                key = list(data.keys())[0]
+                arr = np.array(data[key], dtype=np.float32)
+        else:
+            with open(p, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            arr = np.array(obj["U"] if isinstance(obj, dict) and "U" in obj else obj, dtype=np.float32)
+        if arr.ndim != 4 or arr.shape[-1] != 3:
+            raise SystemExit(f"Invalid wind grid shape: {arr.shape}. Expect [NX,NY,NZ,3].")
+        return arr
+
+    def make_wind_grid():
+        nx, ny, nz = args.wind_grid_size
+        base = np.array(args.wind_grid_default, dtype=np.float32)
+        if args.wind_grid_file:
+            arr = load_wind_grid_from_file(args.wind_grid_file)
+        elif args.wind_mode == "noise":
+            rng = np.random.default_rng(args.wind_noise_seed)
+            arr = rng.uniform(-1.0, 1.0, size=(nx, ny, nz, 3)).astype(np.float32) * float(args.wind_noise_amp)
+            arr += base
+        else:
+            arr = np.zeros((nx, ny, nz, 3), dtype=np.float32)
+            arr[...] = base
+        if args.wind_grid_scale != 1.0:
+            arr *= float(args.wind_grid_scale)
+        return torch.tensor(arr, device=gs.device, dtype=gs.tc_float)
+
+    wind_grid = None
+    if args.wind_mode in ("grid", "noise"):
+        from pathlib import Path  # ensure Path is available in this scope
+        wind_grid = make_wind_grid()
+        grid_origin = torch.tensor(list(args.wind_grid_origin), device=gs.device, dtype=gs.tc_float)
+        grid_spacing = torch.tensor(list(args.wind_grid_spacing), device=gs.device, dtype=gs.tc_float)
+
+        def sample_wind_at(pos_b3: torch.Tensor) -> torch.Tensor:
+            """Trilinear/nearest sampling from wind_grid at world positions (B,3). Returns (B,3)."""
+            # map to grid coords
+            g = (pos_b3 - grid_origin) / grid_spacing.clamp_min(1e-6)
+            nx, ny, nz = wind_grid.shape[:3]
+            if args.wind_grid_interp == "nearest":
+                ix = torch.clamp(torch.round(g[:, 0]).to(torch.int64), 0, nx - 1)
+                iy = torch.clamp(torch.round(g[:, 1]).to(torch.int64), 0, ny - 1)
+                iz = torch.clamp(torch.round(g[:, 2]).to(torch.int64), 0, nz - 1)
+                return wind_grid[ix, iy, iz, :]
+            # linear
+            x = torch.clamp(g[:, 0], 0.0, nx - 1.000001)
+            y = torch.clamp(g[:, 1], 0.0, ny - 1.000001)
+            z = torch.clamp(g[:, 2], 0.0, nz - 1.000001)
+            x0 = torch.floor(x).to(torch.int64)
+            y0 = torch.floor(y).to(torch.int64)
+            z0 = torch.floor(z).to(torch.int64)
+            x1 = torch.clamp(x0 + 1, 0, nx - 1)
+            y1 = torch.clamp(y0 + 1, 0, ny - 1)
+            z1 = torch.clamp(z0 + 1, 0, nz - 1)
+            fx = (x - x0.to(x.dtype)).unsqueeze(1)
+            fy = (y - y0.to(y.dtype)).unsqueeze(1)
+            fz = (z - z0.to(z.dtype)).unsqueeze(1)
+            # gather corners
+            c000 = wind_grid[x0, y0, z0, :]
+            c100 = wind_grid[x1, y0, z0, :]
+            c010 = wind_grid[x0, y1, z0, :]
+            c110 = wind_grid[x1, y1, z0, :]
+            c001 = wind_grid[x0, y0, z1, :]
+            c101 = wind_grid[x1, y0, z1, :]
+            c011 = wind_grid[x0, y1, z1, :]
+            c111 = wind_grid[x1, y1, z1, :]
+            c00 = c000 * (1 - fx) + c100 * fx
+            c10 = c010 * (1 - fx) + c110 * fx
+            c01 = c001 * (1 - fx) + c101 * fx
+            c11 = c011 * (1 - fx) + c111 * fx
+            c0 = c00 * (1 - fy) + c10 * fy
+            c1 = c01 * (1 - fy) + c11 * fy
+            c = c0 * (1 - fz) + c1 * fz
+            return c
+
 
     # Lightweight model parameters (unused if mode == 'sph')
     rain_down_force = torch.tensor([[[0.0, 0.0, -abs(args.rain_down)]]], device=gs.device, dtype=gs.tc_float)
@@ -230,10 +334,15 @@ def main() -> None:
 
     # Run the simulation
     for step in range(int(args.steps)):
-        # Apply wind force to the COM link
-        scene.sim.rigid_solver.apply_links_external_force(
-            force=wind_force, links_idx=com_link, ref="link_com", local=False
-        )
+        # Wind force application (const/grid/noise)
+        if args.wind_mode == "const":
+            wf = wind_const
+        else:
+            # sample at current drone COM (use entity position as proxy)
+            pos_b3 = drone.get_pos()  # (B,3)
+            wf_b3 = sample_wind_at(pos_b3)
+            wf = wf_b3.unsqueeze(1).contiguous()
+        scene.sim.rigid_solver.apply_links_external_force(force=wf, links_idx=com_link, ref="link_com", local=False)
 
         if args.mode == "light":
             # Constant downward "rain" force
