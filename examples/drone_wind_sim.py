@@ -120,6 +120,13 @@ def main() -> None:
     parser.add_argument("--pid-vel", type=float, nargs=3, default=(0.6, 0.0, 0.3), help="PID gains kp ki kd for velocity loop (applies per-axis)")
     parser.add_argument("--pid-att", type=float, nargs=3, default=(0.15, 0.0, 0.05), help="PID gains kp ki kd for attitude (roll/pitch/yaw) loop")
 
+    # Path planning (OMPL optional; fallback RRT implemented here)
+    parser.add_argument("--plan", choices=["none", "rrt", "ompl"], default="none", help="Plan path between first and last waypoint")
+    parser.add_argument("--bounds", type=float, nargs=6, metavar=("MINX","MINY","MINZ","MAXX","MAXY","MAXZ"), default=(-2.0,-2.0,0.0, 2.0,2.0,2.0))
+    parser.add_argument("--obs-sphere", type=float, nargs=4, action="append", metavar=("X","Y","Z","R"), help="Spherical obstacle (m)")
+    parser.add_argument("--plan-time", type=float, default=2.0, help="Planning time budget (s) for OMPL/RRT")
+    parser.add_argument("--rrt-step", type=float, default=0.2, help="RRT step size (m)")
+
     # Light rain parameters
     parser.add_argument("--rain-down", type=float, default=0.8, help="Downward rain force magnitude (N)")
     parser.add_argument("--drag", type=float, default=0.0, help="Linear drag coefficient (N·s/m), 0 disables")
@@ -502,6 +509,108 @@ def main() -> None:
         return torch.clamp(rpms, 0.0, 22000.0)
 
     _waypoints = _load_waypoints()
+    # Optional planning: from current position to last provided waypoint
+    if args.plan != 'none':
+        if not _waypoints:
+            # If no waypoints provided, create a nominal goal ahead
+            _waypoints = [torch.tensor([0.0, 0.0, 0.5], device=gs.device, dtype=gs.tc_float),
+                          torch.tensor([1.0, 0.0, 0.5], device=gs.device, dtype=gs.tc_float)]
+        start_pos = drone.get_pos()[0]
+        goal_pos = _waypoints[-1]
+        minx,miny,minz,maxx,maxy,maxz = map(float, args.bounds)
+        spheres = []
+        if args.obs_sphere:
+            for o in args.obs_sphere:
+                spheres.append(tuple(map(float,o)))  # (x,y,z,r)
+
+        def seg_free(a: torch.Tensor, b: torch.Tensor) -> bool:
+            # check segment-sphere intersection (discretized)
+            n = max(2, int(torch.linalg.norm(b-a).item()/ (args.rrt_step*0.5)))
+            for i in range(n+1):
+                p = a + (b-a)*(i/ max(1,n))
+                # bounds
+                if not (minx<=p[0]<=maxx and miny<=p[1]<=maxy and minz<=p[2]<=maxz):
+                    return False
+                for (cx,cy,cz,cr) in spheres:
+                    if torch.linalg.norm(p - torch.tensor([cx,cy,cz], device=gs.device, dtype=gs.tc_float)) < cr:
+                        return False
+            return True
+
+        planned = []
+        if args.plan == 'rrt':
+            # simple RRT in R^3
+            import random, time
+            step = float(args.rrt_step)
+            t0 = time.time()
+            nodes = [start_pos.clone()]
+            parents = [-1]
+            goal_reached = False
+            while time.time()-t0 < float(args.plan_time):
+                # sample
+                if random.random()<0.2: s = goal_pos
+                else:
+                    s = torch.tensor([random.uniform(minx,maxx), random.uniform(miny,maxy), random.uniform(minz,maxz)], device=gs.device, dtype=gs.tc_float)
+                # nearest
+                d = torch.stack([torch.linalg.norm(n-s) for n in nodes])
+                i = int(torch.argmin(d))
+                q = nodes[i]
+                dir = s - q
+                L = torch.linalg.norm(dir).item()
+                if L<1e-6: continue
+                dir /= L
+                new = q + dir*step
+                if seg_free(q,new):
+                    nodes.append(new)
+                    parents.append(i)
+                    if torch.linalg.norm(new-goal_pos) < step*1.5 and seg_free(new, goal_pos):
+                        nodes.append(goal_pos)
+                        parents.append(len(nodes)-2)
+                        goal_reached = True
+                        break
+            if goal_reached:
+                # backtrack
+                idx = len(nodes)-1
+                path = []
+                while idx!=-1:
+                    path.append(nodes[idx])
+                    idx = parents[idx]
+                path = list(reversed(path))
+                planned = path
+        elif args.plan == 'ompl':
+            try:
+                from ompl import base as ob, geometric as og
+                # define space
+                space = ob.RealVectorStateSpace(3)
+                bounds = ob.RealVectorBounds(3)
+                bounds.setLow(0, minx); bounds.setLow(1,miny); bounds.setLow(2,minz)
+                bounds.setHigh(0,maxx); bounds.setHigh(1,maxy); bounds.setHigh(2,maxz)
+                space.setBounds(bounds)
+                ss = og.SimpleSetup(space)
+                def isValid(state):
+                    x,y,z = state[0],state[1],state[2]
+                    for (cx,cy,cz,cr) in spheres:
+                        if (x-cx)**2 + (y-cy)**2 + (z-cz)**2 < cr**2:
+                            return False
+                    return True
+                ss.setStateValidityChecker(ob.StateValidityCheckerFn(isValid))
+                start = ob.State(space); start()[0]=float(start_pos[0]); start()[1]=float(start_pos[1]); start()[2]=float(start_pos[2])
+                goal = ob.State(space); goal()[0]=float(goal_pos[0]); goal()[1]=float(goal_pos[1]); goal()[2]=float(goal_pos[2])
+                ss.setStartAndGoalStates(start, goal)
+                planner = og.RRTConnect(ss.getSpaceInformation())
+                ss.setPlanner(planner)
+                ss.setup()
+                solved = ss.solve(float(args.plan_time))
+                if solved:
+                    path = ss.getSolutionPath()
+                    path.interpolate(100)
+                    states = path.getStates()
+                    for st in states:
+                        planned.append(torch.tensor([st[0],st[1],st[2]], device=gs.device, dtype=gs.tc_float))
+            except Exception as e:
+                print("OMPL not available:", e)
+
+        if planned:
+            _waypoints = planned
     _wp_idx = 0
     _wp_tol = float(args.wp_radius)
     _ctrl = _make_ctrl(
