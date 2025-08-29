@@ -165,6 +165,21 @@ def main() -> None:
     parser.add_argument('--viz-path-alpha', type=float, default=0.8)
     parser.add_argument('--start', type=float, nargs=3, metavar=("SX","SY","SZ"), help='Optional planning start position (m)')
 
+    # 3D trajectory plotting (matplotlib)
+    parser.add_argument('--plot-3d', action='store_true', help='Save 3D plot of position (line) and velocity (quiver)')
+    parser.add_argument('--plot-file', type=str, default='traj3d.png', help='Output image path for 3D plot')
+    parser.add_argument('--plot-vel-quiver', action='store_true', help='Overlay velocity quivers on the 3D plot')
+    parser.add_argument('--plot-vel-every', type=int, default=10, help='Quiver every N steps (>=1)')
+    parser.add_argument('--plot-vel-scale', type=float, default=1.0, help='Scale factor applied to velocity arrows')
+
+    # Figure-8 waypoint generator
+    parser.add_argument('--f8', action='store_true', help='Generate figure-8 waypoints (Lissajous)')
+    parser.add_argument('--f8-center', type=float, nargs=2, metavar=("CX","CY"), default=(0.0, 0.0))
+    parser.add_argument('--f8-z', type=float, default=0.5)
+    parser.add_argument('--f8-radius', type=float, default=1.0)
+    parser.add_argument('--f8-points', type=int, default=200)
+    parser.add_argument('--f8-laps', type=int, default=1)
+
     # Light rain parameters
     parser.add_argument("--rain-down", type=float, default=0.8, help="Downward rain force magnitude (N)")
     parser.add_argument("--drag", type=float, default=0.0, help="Linear drag coefficient (N·s/m), 0 disables")
@@ -355,7 +370,7 @@ def main() -> None:
             start_pos_pre = torch.tensor(list(args.start), device=gs.device, dtype=gs.tc_float)
         else:
             start_pos_pre = torch.tensor([0.0,0.0,0.0], device=gs.device, dtype=gs.tc_float)
-        # goal: if user provided waypoints, use last; else a nominal goal
+        # goal: if user provided waypoints or f8, use last; else a nominal goal
         goal_pos_pre = None
         if args.wp_file or args.wp:
             # we'll parse here lightweight
@@ -372,6 +387,11 @@ def main() -> None:
                 last_wp = args.wp[-1]
             if last_wp is not None:
                 goal_pos_pre = torch.tensor(list(map(float,last_wp)), device=gs.device, dtype=gs.tc_float)
+        if goal_pos_pre is None and args.f8:
+            cx, cy = args.f8_center; z=float(args.f8_z); R=float(args.f8_radius)
+            import math as _m
+            t = 2.0 * _m.pi  # end of one lap
+            goal_pos_pre = torch.tensor([cx + R * _m.sin(t), cy + 0.5 * R * _m.sin(2.0*t), z], device=gs.device, dtype=gs.tc_float)
         if goal_pos_pre is None:
             goal_pos_pre = start_pos_pre + torch.tensor([1.0,0.0,0.5], device=gs.device, dtype=gs.tc_float)
 
@@ -731,6 +751,19 @@ def main() -> None:
         if args.wp:
             for w in args.wp:
                 wps.append(torch.tensor(w, device=gs.device, dtype=gs.tc_float))
+        if args.f8:
+            # Generate Lissajous figure-8: x = R sin t, y = (R/2) sin(2t)
+            cx, cy = args.f8_center
+            z = float(args.f8_z)
+            R = float(args.f8_radius)
+            N = max(16, int(args.f8_points))
+            laps = max(1, int(args.f8_laps))
+            import math as _m
+            for k in range(N * laps):
+                t = 2.0 * _m.pi * (k / N)
+                x = cx + R * _m.sin(t)
+                y = cy + 0.5 * R * _m.sin(2.0 * t)
+                wps.append(torch.tensor([x, y, z], device=gs.device, dtype=gs.tc_float))
         return wps
 
     class _PID:
@@ -974,6 +1007,8 @@ def main() -> None:
     # Run the simulation
     last_heading = torch.zeros((1, 3), device=gs.device, dtype=gs.tc_float)
     last_heading[0, 0] = 1.0
+    pos_hist: list[np.ndarray] = []
+    vel_hist: list[np.ndarray] = []
     for step in range(int(args.steps)):
         # Wind force application (const/grid/noise)
         if args.wind_mode == "const":
@@ -1050,6 +1085,7 @@ def main() -> None:
         # Read and print state
         pos = drone.get_pos()[0].cpu().numpy()
         vel = drone.get_vel()[0].cpu().numpy()
+        pos_hist.append(pos.copy()); vel_hist.append(vel.copy())
         print(f"{step:04d}: position={pos}, velocity={vel}")
 
     # Finalize recording (write one MP4 per camera)
@@ -1059,6 +1095,54 @@ def main() -> None:
         for idx, c in enumerate(cams):
             filename = base if len(cams) == 1 else f"{root}_cam{idx}{ext or '.mp4'}"
             c.stop_recording(save_to_filename=filename, fps=int(args.fps))
+
+    # 3D plot of trajectory and velocities
+    if args.plot_3d and len(pos_hist) > 1:
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+            P = np.array([np.asarray(p, dtype=np.float64).reshape(3) for p in pos_hist], dtype=np.float64)
+            V = np.array([np.asarray(v, dtype=np.float64).reshape(3) for v in vel_hist], dtype=np.float64)
+            fig = plt.figure(figsize=(8, 6))
+            ax = fig.add_subplot(111, projection='3d')
+            ax.plot(P[:, 0], P[:, 1], P[:, 2], color='tab:blue', linewidth=2, label='position')
+            # optional velocity quiver
+            if args.plot_vel_quiver:
+                step_q = max(1, int(args.plot_vel_every))
+                idx = np.arange(0, len(P), step_q)
+                if len(idx) > 0:
+                    Vq = V[idx, :] * float(args.plot_vel_scale)
+                    try:
+                        ax.quiver(P[idx, 0], P[idx, 1], P[idx, 2], Vq[:, 0], Vq[:, 1], Vq[:, 2],
+                                  length=None, normalize=False, color='tab:orange', linewidth=0.5,
+                                  arrow_length_ratio=0.2)
+                    except Exception:
+                        pass
+            # axes labels
+            ax.set_xlabel('X [m]')
+            ax.set_ylabel('Y [m]')
+            ax.set_zlabel('Z [m]')
+            ax.legend(loc='upper left')
+            # set limits a bit padded around data
+            try:
+                mins = P.min(axis=0); maxs = P.max(axis=0)
+                pad = 0.1 * (maxs - mins + 1e-6)
+                ax.set_xlim(mins[0]-pad[0], maxs[0]+pad[0])
+                ax.set_ylim(mins[1]-pad[1], maxs[1]+pad[1])
+                ax.set_zlim(mins[2]-pad[2], maxs[2]+pad[2])
+            except Exception:
+                pass
+            plt.tight_layout()
+            out_path = args.plot_file
+            os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+            fig.savefig(out_path, dpi=150)
+            plt.close(fig)
+            print(f"Saved 3D trajectory plot to: {out_path}")
+        except Exception as e:
+            print("3D plotting failed:", e)
 
 
 if __name__ == "__main__":
